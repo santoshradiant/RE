@@ -36,7 +36,7 @@ Usage:
 No external dependencies. Python 3.7+ standard library only.
 """
 
-import os, re, sys, argparse
+import os, re, sys, argparse, csv
 from collections import defaultdict
 from datetime import datetime
 
@@ -77,7 +77,8 @@ TYPE_LABELS = {
 # is ambiguous, content-based detection handles the fallback.
 FOLDER_KEYWORDS = {
     'cobol': {'cobol','cbl','pgm','pgms','cobpgm','cobsrc','cobolsrc',
-              'mainpgm','program','programs','coblib'},
+              'mainpgm','program','programs','coblib',
+              'ctc'},   # AT&T CRIS: CTC = CICS Transaction Code folders (COBOL online programs)
     'copy':  {'copy','copybook','copybooks','copylib','cpy','cpylib',
               'copymem','include','includes'},
     'jcl':   {'jcl','jcllib','jclproc','jclprocs','jclsrc',
@@ -901,7 +902,7 @@ LEVEL_META = {
 def he(s):
     return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
 
-def generate_html(results, file_counts, scan_root, scan_time):
+def generate_html(results, file_counts, scan_root, scan_time, max_rows=100, csv_path=''):
     total   = sum(len(v) for v in results.values())
     by_lvl  = defaultdict(int)
     for ap in ANTI_PATTERNS:
@@ -931,10 +932,20 @@ def generate_html(results, file_counts, scan_root, scan_time):
           <td style="text-align:center;font-weight:{"800" if fc>0 else "400"};color:{"#D63B3B" if fc>0 else "#AAA"}">{fc}</td>
         </tr>'''
 
-    # Finding rows
+    # Finding rows — capped per pattern to keep the HTML browser-friendly
     finding_rows = ''
+    html_total   = 0
+    trunc_total  = 0
     for ap in ANTI_PATTERNS:
-        for f in results[ap['id']]:
+        all_f  = results[ap['id']]
+        total_count = len(all_f)
+        if max_rows > 0 and total_count > max_rows:
+            shown = all_f[:max_rows]
+            trunc_total += total_count - max_rows
+        else:
+            shown = all_f
+        html_total += len(shown)
+        for f in shown:
             rel = os.path.relpath(f['file'], scan_root) if os.path.isabs(f['file']) else f['file']
             ln  = f['lineno'] if f['lineno'] else '—'
             lbl,lbg,ltc,_ = LEVEL_META[ap['level']]
@@ -945,6 +956,19 @@ def generate_html(results, file_counts, scan_root, scan_time):
               <td style="font-family:monospace;font-size:0.72rem;color:#5A6075;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{he(f["snippet"])}">{he(f["snippet"][:100])}</td>
               <td style="font-size:0.76rem;color:#5A6075">{he(f["detail"])}</td>
             </tr>'''
+
+    # Build truncation banner if any pattern was capped
+    csv_note = f' Full {total:,} findings exported to <strong>{he(os.path.basename(csv_path))}</strong> — open in Excel to filter/sort.' if csv_path else ''
+    if trunc_total > 0 and max_rows > 0:
+        trunc_banner = (
+            f'<div style="background:#FFF3CD;border:1px solid #F9E4B7;border-radius:7px;padding:10px 14px;'
+            f'margin-bottom:10px;font-size:0.78rem;color:#7A5A00">'
+            f'<strong>⚠ Large result set:</strong> HTML table shows first {max_rows} findings per pattern '
+            f'({html_total:,} of {total:,} total). {trunc_total:,} findings are hidden from this view.{csv_note}'
+            f'</div>'
+        )
+    else:
+        trunc_banner = f'<div style="font-size:0.75rem;color:#8A9AB0;margin-bottom:8px">{csv_note}</div>' if csv_path else ''
 
     # Level legend
     legend = ''.join(
@@ -1056,8 +1080,9 @@ tbody tr:hover{{background:#EEF1F8}}
 <!-- FINDINGS -->
 <div class="card">
   <h2>All Findings</h2>
+  {trunc_banner}
   <div class="filter-bar">
-    <button class="fbtn active" onclick="filterLevel('all',this)">All ({total})</button>
+    <button class="fbtn active" onclick="filterLevel('all',this)">All ({html_total})</button>
     <button class="fbtn fa" onclick="filterLevel('AUTO',this)">CAST Auto ({by_lvl["AUTO"]})</button>
     <button class="fbtn fp" onclick="filterLevel('PARTIAL',this)">CAST Partial ({by_lvl["PARTIAL"]})</button>
     <button class="fbtn fh" onclick="filterLevel('HUMAN',this)">Human Only ({by_lvl["HUMAN"]})</button>
@@ -1066,7 +1091,7 @@ tbody tr:hover{{background:#EEF1F8}}
     {cat_btns}
     <button class="fbtn" onclick="clearAll(this)" style="margin-left:6px">Clear</button>
   </div>
-  <div id="vis-count" style="font-size:0.75rem;color:#8A9AB0;margin-bottom:9px">{total} findings shown</div>
+  <div id="vis-count" style="font-size:0.75rem;color:#8A9AB0;margin-bottom:9px">{html_total} findings shown</div>
   <div class="ovx">
   <table>
     <thead><tr><th>Pattern</th><th>File</th><th style="text-align:center">Line</th><th>Snippet</th><th>Detail</th></tr></thead>
@@ -1159,6 +1184,9 @@ def main():
                         help='Extra extensions to treat as JCL. E.g. --jcl-ext .cntl,.job2')
     parser.add_argument('--pli-ext', default='',
                         help='Extra extensions to treat as PL/I.')
+    parser.add_argument('--max-rows', type=int, default=100,
+                        help='Max findings shown per pattern in HTML (default 100; 0 = no limit). '
+                             'Full findings are always exported to a CSV alongside the HTML.')
     args=parser.parse_args()
 
     root=os.path.abspath(args.root)
@@ -1271,16 +1299,39 @@ def main():
 
     file_counts={ft:len(lst) for ft,lst in files.items()}
     scan_time=datetime.now().strftime('%Y-%m-%d %H:%M')
+    total=sum(len(v) for v in results.values())
+    total_files=sum(file_counts.values())
 
-    print(f'\nGenerating report → {args.output}')
-    html=generate_html(results,file_counts,root,scan_time)
+    # ── CSV export (all findings — use this in Excel for full drill-down) ──
+    csv_path = os.path.splitext(args.output)[0] + '.csv'
+    print(f'\nExporting CSV  → {csv_path}')
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as csvf:
+        # utf-8-sig writes BOM so Excel on Windows opens it correctly
+        writer = csv.writer(csvf)
+        writer.writerow(['Pattern ID','Pattern Name','Category','Detection Level',
+                         'File','Line','Snippet','Detail'])
+        for ap in ANTI_PATTERNS:
+            lbl = LEVEL_META[ap['level']][0]
+            for f in results[ap['id']]:
+                rel = os.path.relpath(f['file'], root) if os.path.isabs(f['file']) else f['file']
+                writer.writerow([
+                    ap['id'], ap['name'], ap['cat'], lbl,
+                    rel, f['lineno'] or '', f['snippet'], f['detail'],
+                ])
+    print(f'  {total:,} rows written.')
+
+    # ── HTML report (capped per pattern for browser performance) ──
+    print(f'Generating HTML → {args.output}')
+    if args.max_rows > 0 and total > args.max_rows * len(ANTI_PATTERNS):
+        print(f'  (Showing first {args.max_rows} findings per pattern in HTML; all data is in CSV)')
+    html=generate_html(results,file_counts,root,scan_time,
+                       max_rows=args.max_rows, csv_path=csv_path)
     with open(args.output,'w',encoding='utf-8') as f:
         f.write(html)
 
-    total=sum(len(v) for v in results.values())
-    total_files=sum(file_counts.values())
-    print(f'Done. {total} findings across {total_files} files.')
-    print(f'Open {args.output} in any browser.')
+    print(f'\nDone. {total:,} findings across {total_files:,} files.')
+    print(f'  HTML report : {args.output}')
+    print(f'  CSV export  : {csv_path}  ← open in Excel for full finding list')
 
 if __name__=='__main__':
     main()
