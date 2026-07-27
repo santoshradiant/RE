@@ -4,8 +4,9 @@ mainframe_scan.py — Comprehensive Mainframe Anti-Pattern Scanner v2.0
 Radiant Digital / AI-Infused Legacy Migration Practice
 
 53 anti-patterns across 13 artefact types. Fully recursive.
+Works on Windows, Linux, and macOS.
 
-Artefact types:
+Default extensions recognised:
   COBOL (.cbl .cob .cobol .cbc .cblcpy)
   JCL   (.jcl .job .proc .prc)
   Copy  (.cpy .copy .cpb .copybook)
@@ -21,8 +22,16 @@ Artefact types:
   NAT   (.nat .nsp)
 
 Usage:
-  python mainframe_scan.py /path/to/source
-  python mainframe_scan.py /path/to/source --output report.html
+  python mainframe_scan.py C:\\source\\root
+  python mainframe_scan.py C:\\source\\root --output report.html
+
+  # If COBOL files have no extension or non-standard ones, add them:
+  python mainframe_scan.py C:\\source --cobol-ext .pgm,.src,.txt,""
+  python mainframe_scan.py C:\\source --copy-ext .lib,.inc
+  python mainframe_scan.py C:\\source --jcl-ext .cntl,.job,.proc
+
+  # Show what extensions exist in the tree (diagnose before scanning):
+  python mainframe_scan.py C:\\source --diagnose
 
 No external dependencies. Python 3.7+ standard library only.
 """
@@ -60,15 +69,225 @@ TYPE_LABELS = {
     'nat':'Natural / ADABAS',
 }
 
-def collect_files(root):
-    files = defaultdict(list)
+# ── Folder-name keyword map ───────────────────────────────────────────────────
+# If the folder name contains any of these tokens, all extensionless (or
+# unrecognised) files in that folder are classified as the mapped type.
+# Keep keywords specific — avoid generic words like 'batch', 'src', 'lib'
+# that appear in folder names of multiple languages. When the folder name
+# is ambiguous, content-based detection handles the fallback.
+FOLDER_KEYWORDS = {
+    'cobol': {'cobol','cbl','pgm','pgms','cobpgm','cobsrc','cobolsrc',
+              'mainpgm','program','programs','coblib'},
+    'copy':  {'copy','copybook','copybooks','copylib','cpy','cpylib',
+              'copymem','include','includes'},
+    'jcl':   {'jcl','jcllib','jclproc','jclprocs','jclsrc',
+              'job','jobs','proc','procs','cntl','cntllib',
+              'control','controls'},
+    'bms':   {'bms','mapset','mapsets','bmsmap','bmsmaps',
+              'screens','screen','mfs'},
+    'ims':   {'ims','imsdb','imsdc','dbd','dbds','psb','psbs'},
+    'pli':   {'pli','pl1','plisrc','plipgm','pl1src','plisource'},
+    'hlasm': {'asm','hlasm','assembler','assemble','asmlib',
+              'macros','mac','macro','maclib'},
+    'rexx':  {'rexx','rexxlib','rxc','clist','clists'},
+    'sql':   {'sql','ddl','dclgen','db2ddl','db2sql','queries'},
+    'sort':  {'sort','dfsort','sortcntl','syncsort','icetool'},
+    'nat':   {'natural','natlib','adabas'},
+    'ezt':   {'easytrieve','ezt','eztlib'},
+    'ca7':   {'ca7','tws','scheduler','schedules','jobd'},
+}
+
+# ── Content-based type detection ──────────────────────────────────────────────
+def detect_type_by_content(path):
+    """
+    Read the first 40 lines of a file and identify its type from content
+    signatures. Returns a type string or None if undetermined.
+    Used as a fallback when folder name and extension both give no match.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            raw = [f.readline().rstrip('\n\r') for _ in range(40)]
+    except OSError:
+        return None
+
+    text_up = '\n'.join(raw).upper()
+
+    # JCL: majority of lines start with //
+    jcl_hits = sum(1 for l in raw if l.startswith('//'))
+    if jcl_hits >= 2:
+        return 'jcl'
+
+    # BMS mapset macros
+    if any(kw in text_up for kw in ('DFHMSD', 'DFHMDI', 'DFHMDF')):
+        return 'bms'
+
+    # IMS DBD / PSB
+    if any(kw in text_up for kw in ('DBD  NAME=', 'DBD NAME=', 'PSBGEN', 'PCB  TYPE=', 'PCB TYPE=')):
+        return 'ims'
+
+    # DFSORT control cards (standalone)
+    if any(kw in text_up for kw in ('SORT FIELDS=', 'INCLUDE COND=', 'OMIT COND=',
+                                     'SUM FIELDS=', 'OUTREC FIELDS=', 'INREC FIELDS=')):
+        return 'sort'
+
+    # SQL / DDL
+    if any(kw in text_up for kw in ('CREATE TABLE', 'CREATE VIEW', 'ALTER TABLE',
+                                     'DROP TABLE', 'INSERT INTO', 'DECLARE CURSOR',
+                                     'DECLARE GLOBAL')):
+        return 'sql'
+
+    # PL/I — must come before COBOL check (PROCEDURE is shared)
+    if re.search(r'\bPROCEDURE\s+OPTIONS\b|\bDCL\s|\bDECLARE\s', text_up):
+        if 'IDENTIFICATION DIVISION' not in text_up and 'PROGRAM-ID' not in text_up:
+            return 'pli'
+
+    # HLASM / Assembler
+    if any(kw in text_up for kw in (' CSECT', ' DSECT', ' DC ', ' DS ', ' USING ',
+                                      'START 0', 'TITLE \'')):
+        if 'IDENTIFICATION DIVISION' not in text_up:
+            return 'hlasm'
+
+    # REXX
+    first_line = raw[0].strip().upper() if raw else ''
+    if '/* REXX' in first_line or (first_line.startswith('/*') and
+            any(kw in text_up for kw in ('SAY ', 'PULL ', 'PARSE ', 'EXECIO', 'ADDRESS TSO'))):
+        return 'rexx'
+
+    # COBOL program — has IDENTIFICATION DIVISION or PROGRAM-ID
+    if any(kw in text_up for kw in ('IDENTIFICATION DIVISION', 'ID DIVISION',
+                                     'PROGRAM-ID', 'PROCEDURE DIVISION',
+                                     'ENVIRONMENT DIVISION', 'DATA DIVISION')):
+        return 'cobol'
+
+    # Copybook — has PIC/PICTURE level definitions but no program header
+    if re.search(r'\bPIC\b|\bPICTURE\b', text_up):
+        return 'copy'
+
+    # Bare level-01 / 77 definitions — likely a copybook fragment
+    if re.search(r'^\s*(01|77)\s+\w', '\n'.join(raw), re.MULTILINE | re.IGNORECASE):
+        return 'copy'
+
+    return None  # cannot determine
+
+
+def _folder_type(dirpath, root):
+    """
+    Classify a directory by scanning its path components from innermost to root.
+
+    This handles multi-level nesting such as:
+      Source Code/JCL/Site-Y/   → 'jcl'  (found via grandparent JCL)
+      Source Code/COPYBOOKS/    → 'copy' (found via parent COPYBOOKS)
+      Source Code/CTC/Site A/   → None   (no keyword match → content-detect)
+
+    Precedence per path component: exact keyword match > longest substring match.
+    Stops climbing as soon as any match is found at a given depth level.
+    """
+    try:
+        rel = os.path.relpath(dirpath, root)
+    except ValueError:
+        rel = dirpath
+
+    # Split on both / and \ and strip whitespace / dots
+    parts = [p.strip().lower() for p in re.split(r'[/\\]', rel) if p.strip() and p != '.']
+
+    # Pass 1 — exact match, scanning innermost component first
+    for part in reversed(parts):
+        for ftype, keywords in FOLDER_KEYWORDS.items():
+            if part in keywords:
+                return ftype
+
+    # Pass 2 — longest substring match, innermost component first
+    #   Stop climbing once a component yields any match (avoids a vague
+    #   ancestor overriding a more specific nearby non-exact match).
+    for part in reversed(parts):
+        best_type = None
+        best_len  = 0
+        for ftype, keywords in FOLDER_KEYWORDS.items():
+            for kw in keywords:
+                if kw in part and len(kw) > best_len:
+                    best_len  = len(kw)
+                    best_type = ftype
+        if best_type:
+            return best_type
+
+    return None
+
+
+def collect_files(root, ext_map=None):
+    """
+    Walk root recursively. Classification priority per file:
+      1. Extension map (EXT_MAP + any --*-ext overrides)
+      2. Folder name keywords  (FOLDER_KEYWORDS)
+      3. File content sampling (detect_type_by_content)
+    Returns (files_dict, skipped_dict).
+    """
+    emap = ext_map if ext_map is not None else EXT_MAP
+    files   = defaultdict(list)
+    skipped = defaultdict(int)
+    # Cache per-folder decisions so we only sample content once per folder
+    folder_cache = {}  # dirpath -> type or None
+
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
-            ext = os.path.splitext(fn)[1].lower()
-            ft = EXT_MAP.get(ext)
+            full = os.path.join(dirpath, fn)
+            ext  = os.path.splitext(fn)[1].lower()
+
+            # 1. Extension
+            ft = emap.get(ext)
+
+            # 2 & 3. For unknown/missing extension, use folder path → content
+            if ft is None:
+                if dirpath not in folder_cache:
+                    # Try full folder path hierarchy first (handles Site-X subfolders)
+                    ft_folder = _folder_type(dirpath, root)
+                    if ft_folder:
+                        folder_cache[dirpath] = ft_folder
+                    else:
+                        # Sample this file's content to decide for the whole folder
+                        folder_cache[dirpath] = detect_type_by_content(full)
+                ft = folder_cache[dirpath]
+
             if ft:
-                files[ft].append(os.path.join(dirpath, fn))
-    return files
+                files[ft].append(full)
+            else:
+                skipped[ext if ext else '(no extension)'] += 1
+
+    return files, skipped
+
+
+def diagnose_extensions(root):
+    """Print extension + folder inventory then exit. Helps diagnose missed files."""
+    ext_counts    = defaultdict(int)
+    folder_counts = defaultdict(lambda: defaultdict(int))  # folder -> ext -> count
+
+    for dirpath, _, filenames in os.walk(root):
+        rel_folder = os.path.relpath(dirpath, root)
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower() or '(no ext)'
+            ext_counts[ext] += 1
+            folder_counts[rel_folder][ext] += 1
+
+    print(f'\n── Extension inventory: {root}')
+    print(f'{"Extension":<25} {"Files":>6}  {"Auto-classified as"}')
+    print('─' * 60)
+    for ext, cnt in sorted(ext_counts.items(), key=lambda x: -x[1]):
+        known = EXT_MAP.get(ext, '')
+        label = f'← {TYPE_LABELS.get(known, known)}' if known else ''
+        print(f'{ext:<25} {cnt:>6}  {label}')
+
+    print(f'\n── Folder breakdown (top 30):')
+    print(f'{"Folder":<40} {"Types found"}')
+    print('─' * 70)
+    for folder, ext_map_local in sorted(folder_counts.items())[:30]:
+        ft = _folder_type(os.path.join(root, folder), root) or '? (content-detect)'
+        summary = ', '.join(f'{e}×{c}' for e,c in sorted(ext_map_local.items(), key=lambda x:-x[1]))
+        print(f'{folder:<40} → {ft}  [{summary}]')
+
+    print()
+    print('Tip: if a folder shows "? (content-detect)", the script will sample')
+    print('     the first file in that folder to determine its type automatically.')
+    print('     If that fails, use --cobol-ext, --copy-ext, or --jcl-ext to force.')
+    sys.exit(0)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PARSERS
@@ -905,26 +1124,85 @@ function clearAll(btn){{aAP=null;aLvl=null;aCat=null;document.querySelectorAll('
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _parse_ext_list(s):
+    """Parse comma-separated extension list. Empty string token → no-extension files."""
+    result = set()
+    for tok in s.split(','):
+        tok = tok.strip()
+        if tok == '""' or tok == "''":
+            result.add('')          # match files with no extension
+        elif tok:
+            result.add(tok if tok.startswith('.') else '.' + tok)
+    return result
+
+
 def main():
-    parser=argparse.ArgumentParser(description='Mainframe Anti-Pattern Scanner v2.0 — Radiant Digital')
-    parser.add_argument('root',help='Root directory of mainframe source tree (scanned recursively)')
-    parser.add_argument('--output',default='mainframe_scan_report.html',help='Output HTML file (default: mainframe_scan_report.html)')
+    parser=argparse.ArgumentParser(
+        description='Mainframe Anti-Pattern Scanner v2.0 — Radiant Digital',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Examples:
+  python mainframe_scan.py C:\\source
+  python mainframe_scan.py C:\\source --diagnose
+  python mainframe_scan.py C:\\source --cobol-ext .pgm,.src,""
+  python mainframe_scan.py C:\\source --copy-ext .lib,.inc --jcl-ext .cntl
+''')
+    parser.add_argument('root', help='Root directory of mainframe source tree (scanned recursively)')
+    parser.add_argument('--output', default='mainframe_scan_report.html',
+                        help='Output HTML filename (default: mainframe_scan_report.html)')
+    parser.add_argument('--diagnose', action='store_true',
+                        help='Show all file extensions found in the tree and exit (run this first if files are not being picked up)')
+    parser.add_argument('--cobol-ext', default='',
+                        help='Extra extensions to treat as COBOL, comma-separated. Use "" for no-extension files. E.g. --cobol-ext .pgm,.src,""')
+    parser.add_argument('--copy-ext', default='',
+                        help='Extra extensions to treat as Copybooks. E.g. --copy-ext .lib,.inc')
+    parser.add_argument('--jcl-ext', default='',
+                        help='Extra extensions to treat as JCL. E.g. --jcl-ext .cntl,.job2')
+    parser.add_argument('--pli-ext', default='',
+                        help='Extra extensions to treat as PL/I.')
     args=parser.parse_args()
 
     root=os.path.abspath(args.root)
     if not os.path.isdir(root):
-        print(f'ERROR: "{root}" is not a directory.',file=sys.stderr); sys.exit(1)
+        print(f'ERROR: "{root}" is not a directory.', file=sys.stderr); sys.exit(1)
+
+    if args.diagnose:
+        diagnose_extensions(root)   # prints and exits
+
+    # Build a merged extension map incorporating any user overrides
+    ext_map = dict(EXT_MAP)
+    for extra, ftype in [
+        (args.cobol_ext, 'cobol'),
+        (args.copy_ext,  'copy'),
+        (args.jcl_ext,   'jcl'),
+        (args.pli_ext,   'pli'),
+    ]:
+        if extra:
+            for ext in _parse_ext_list(extra):
+                ext_map[ext] = ftype
 
     print(f'Mainframe Anti-Pattern Scanner v2.0 — Radiant Digital')
     print(f'Scanning: {root}  (recursive)')
-    files=collect_files(root)
+    files, skipped = collect_files(root, ext_map)
     for ft,label in TYPE_LABELS.items():
         cnt=len(files.get(ft,[]))
         if cnt: print(f'  {label}: {cnt} files')
+
+    # Warn about unrecognised files — helps diagnose extension mismatches
+    if skipped:
+        total_skipped = sum(skipped.values())
+        print(f'\n  WARNING: {total_skipped} files were not recognised (extension not in scan list):')
+        for ext, cnt in sorted(skipped.items(), key=lambda x: -x[1])[:10]:
+            print(f'    {ext or "(no extension)"}: {cnt} files')
+        if len(skipped) > 10:
+            print(f'    ... and {len(skipped)-10} more extension types')
+        print(f'  Run with --diagnose to see the full list, then use --cobol-ext / --copy-ext to add them.\n')
     print()
 
-    cobol=files.get('cobol',[]); jcl=files.get('jcl',[]); copy_f=files.get('copy',[])
-    rexx_f=files.get('rexx',[]); sql_f=files.get('sql',[])
+    cobol  = files.get('cobol', [])
+    jcl    = files.get('jcl',   [])
+    copy_f = files.get('copy',  [])
+    rexx_f = files.get('rexx',  [])
+    sql_f  = files.get('sql',   [])
 
     results={ap['id']:[] for ap in ANTI_PATTERNS}
 
