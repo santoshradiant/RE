@@ -531,8 +531,58 @@ LIST_CAP  = 200     # max items kept in any list-valued column
 CELL_CAP  = 8000    # max characters in any list-valued column
 
 
+# Mainframe source frequently carries bytes that are not text: NULs from binary
+# members, packed-decimal or COMP fields embedded in a copybook, EBCDIC artefacts,
+# stray control characters. Written straight into a CSV these produce a file that
+# Python's own csv module refuses to read back ("line contains NUL") and that
+# Excel renders as mojibake. Every string leaving this script is scrubbed.
+_CTRL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _clean(s):
+    if not isinstance(s, str):
+        return s
+    if _CTRL.search(s):
+        s = _CTRL.sub('', s)
+    return s.replace('\r', ' ').replace('\n', ' ')
+
+
 def _join(items, cap=LIST_CAP):
-    return '; '.join(_uniq(items, cap))[:CELL_CAP]
+    return _clean('; '.join(_uniq(items, cap))[:CELL_CAP])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COBOL VERIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# FOLDER_KEYWORDS types every extensionless file in a matching folder by the
+# folder's name alone. For 'ctc' that means every file in a CICS Transaction
+# Code folder is called COBOL — including the fixed-width data and live
+# input/output files that share those folders. On a real estate this inflated
+# the COBOL population roughly twenty-fold and diluted every per-file metric
+# built on it.
+#
+# PROGRAM-ID, IDENTIFICATION DIVISION and PROCEDURE DIVISION are mandatory
+# structural elements of a COBOL program. Requiring one before accepting a
+# folder-name verdict costs nothing — the file has already been read.
+
+_COBOL_MARKERS = (
+    'IDENTIFICATION DIVISION', 'ID DIVISION', 'PROGRAM-ID',
+    'PROCEDURE DIVISION', 'ENVIRONMENT DIVISION', 'WORKING-STORAGE SECTION',
+)
+
+
+def looks_like_cobol(lines, scan=400):
+    """True when the file carries at least one mandatory COBOL structural marker."""
+    text = '\n'.join(lines[:scan]).upper()
+    return any(mk in text for mk in _COBOL_MARKERS)
+
+
+def looks_like_copybook(lines, scan=400):
+    """A copybook has no PROGRAM-ID but does declare data: PIC clauses, 01 levels."""
+    text = '\n'.join(lines[:scan]).upper()
+    return bool(re.search(r'\bPIC(?:TURE)?\s', text)
+                or re.search(r'^\s*(?:\d{6}.)?\s*(01|05|77)\s+[A-Z]', text, re.M))
 
 
 def classification_route(path, root, emap):
@@ -551,15 +601,24 @@ def classification_route(path, root, emap):
     return 'content detection'
 
 
-def process_file(path, ftype, root, repo_name, route=''):
+def process_file(path, ftype, root, repo_name, route='', verify_cobol=False):
     lines, raw = _read_lines(path)
     if lines is None:
         return None
+
+    # The file is already in memory, so verification is free.
+    if verify_cobol and ftype == 'cobol' and not looks_like_cobol(lines):
+        ftype = 'copy' if looks_like_copybook(lines) else 'data'
+        route = (route or '') + ' → re-typed (no COBOL marker)'
 
     if ftype in ('cobol', 'copy'):
         counts, code_pairs = cobol_loc(lines)
     else:
         counts, code_pairs = generic_loc(lines, ftype)
+
+    if ftype == 'data':
+        # Counted and kept for inventory, but carries no source semantics.
+        code_pairs = []
 
     row = {c: '' for c in CSV_COLUMNS}
     row.update({
@@ -568,7 +627,7 @@ def process_file(path, ftype, root, repo_name, route=''):
         'file_name':      os.path.basename(path),
         'extension':      os.path.splitext(path)[1].lower() or '(none)',
         'type':           ftype,
-        'type_label':     TYPE_LABELS.get(ftype, ftype),
+        'type_label':     TYPE_LABELS.get(ftype, 'Data / non-source'),
         'classified_by':  route,
         'size_bytes':     len(raw),
         'sha1':           hashlib.sha1(raw).hexdigest(),
@@ -630,6 +689,10 @@ def process_file(path, ftype, root, repo_name, route=''):
         })
 
     row['evidence_score'] = evidence_score(row)
+    # Final guard: scrub every string cell, whatever produced it.
+    for k, v in row.items():
+        if isinstance(v, str) and v:
+            row[k] = _clean(v)
     return row
 
 
@@ -649,6 +712,13 @@ def main():
     p.add_argument('--copy-ext',  default='', help='Extra copybook extensions')
     p.add_argument('--jcl-ext',   default='', help='Extra JCL extensions')
     p.add_argument('--types', default='', help='Restrict to these types, e.g. cobol,jcl,copy')
+    p.add_argument('--verify-cobol', action='store_true',
+                   help='Require a COBOL structural marker (IDENTIFICATION DIVISION, '
+                        'PROGRAM-ID, PROCEDURE DIVISION) before accepting a file as '
+                        'COBOL. Files failing the test are re-typed as a copybook if '
+                        'they declare data, otherwise as "data" and excluded from '
+                        'source metrics. Strongly recommended where FOLDER_KEYWORDS '
+                        'types extensionless files by folder name alone.')
     p.add_argument('--per-file-detect', action='store_true',
                    help='Re-detect type individually for every file that reached the '
                         'content-detection fallback. mainframe_scan.py samples only the '
@@ -676,6 +746,7 @@ def main():
     all_rows = 0
     by_type = defaultdict(int)
     by_route = defaultdict(int)
+    retyped = defaultdict(int)
     loc_by_type = defaultdict(int)
     skipped_total = defaultdict(int)
 
@@ -736,14 +807,18 @@ def main():
                     continue
                 for path in paths:
                     row = process_file(path, ftype, root, repo_name,
-                                       route=routes.get(path, ''))
+                                       route=routes.get(path, ''),
+                                       verify_cobol=args.verify_cobol)
                     if row is None:
                         continue
                     writer.writerow(row)
                     all_rows += 1
                     n += 1
-                    by_type[ftype] += 1
-                    loc_by_type[ftype] += row['physical_lines']
+                    actual = row['type']
+                    if actual != ftype:
+                        retyped[f'{ftype} → {actual}'] += 1
+                    by_type[actual] += 1
+                    loc_by_type[actual] += row['physical_lines']
                     by_route[row['classified_by']] += 1
 
                     if not args.quiet and n % 2000 == 0:
@@ -764,9 +839,23 @@ def main():
         print(f'{"Type":<28} {"Files":>9} {"Physical LOC":>14}')
         print('─' * 54)
         for t in sorted(by_type, key=lambda x: -loc_by_type[x]):
-            print(f'{TYPE_LABELS.get(t, t):<28} {by_type[t]:>9,} {loc_by_type[t]:>14,}')
+            print(f'{TYPE_LABELS.get(t, "Data / non-source"):<28} '
+                  f'{by_type[t]:>9,} {loc_by_type[t]:>14,}')
         print('─' * 54)
         print(f'{"TOTAL":<28} {all_rows:>9,} {sum(loc_by_type.values()):>14,}')
+
+        # Source totals excluding anything verification demoted to data.
+        if retyped:
+            src_f = all_rows - by_type.get('data', 0)
+            src_l = sum(loc_by_type.values()) - loc_by_type.get('data', 0)
+            print(f'\n── --verify-cobol reclassified:')
+            for k, v in sorted(retyped.items(), key=lambda x: -x[1]):
+                print(f'   {k:<30} {v:>9,}')
+            print(f'\n{"SOURCE ONLY (excl. data)":<28} {src_f:>9,} {src_l:>14,}')
+            print(f'   {by_type.get("data", 0):,} files had no COBOL structural marker '
+                  f'and are\n'
+                  f'   counted as data. They remain in the CSV as type "data" so the\n'
+                  f'   inventory is complete, but they are not source.')
 
         # How the estate was typed. In a repository with no file extensions,
         # this is the confidence statement for every number above it.
